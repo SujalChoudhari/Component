@@ -1,89 +1,62 @@
-# ai_manager.py
+# src/ai_manager.py
 import inspect
 import os
-import time  # Import the time module
-from collections import deque  # For an efficient queue
 from typing import Any, Dict, List, Optional
 
 from google import genai
-from google.genai import (
-    errors,  # Import errors module for ClientError (for potential rate limit errors)
-    types,
-)
+from google.genai import types
 
 from src.base_component import BaseComponent
 from src.manager import ComponentManager
+from src.gemini_chat_agent import GeminiChatAgent
+from src.logger import log_message
 
 
 class AIComponentManager:
     """
     Manages AI interaction, converting loaded components into Gemini tools,
     and handling tool calls based on Gemini's responses.
-    This version uses the `google-genai` library and includes rate limiting.
+    This version orchestrates between ComponentManager and GeminiChatAgent
+    for autonomous operation with user interruption.
     """
-
-    # Define rate limits
-    RPM_LIMIT = 15  # Requests Per Minute
-    # We'll use a window of 60 seconds. Max requests within this window.
 
     def __init__(
         self,
         components_dir: str = "components",
         model_name: str = "gemini-1.5-flash-latest",
         api_key: Optional[str] = None,
+        system_prompt: Optional[str] = None,
     ):
-        self.component_manager = ComponentManager(components_dir)
-        self.component_manager.load_all_components()
-
+        self.components_dir = components_dir
+        # Initialize ComponentManager here; its refresh_components will handle initial load
+        self.component_manager = ComponentManager(self.components_dir)
         self.model_name = model_name
 
-        _api_key = api_key or os.environ.get("GEMINI_API_KEY")
-        if not _api_key:
-            raise ValueError(
-                "GEMINI_API_KEY must be provided via `api_key` argument or "
-                "set as an environment variable."
-            )
-        self.gemini_client = genai.Client(api_key=_api_key)
+        self.available_tools: List[types.Tool] = [] # Will be built after components are loaded
 
-        self.available_tools: List[types.Tool] = self._build_gemini_tools()
-        self.chat_history: List[types.Content] = []
+        self.gemini_agent = GeminiChatAgent(
+            model_name=self.model_name,
+            api_key=api_key,
+            initial_system_prompt=system_prompt,
+        )
+        self.gemini_agent.set_tool_executor_callback(self._call_tool)
 
-        # Rate limiting variables
-        # Stores timestamps of the last RPM_LIMIT requests
-        self.request_timestamps = deque()
+        log_message("SYSTEM_INIT", f"AI Component Manager initialized for autonomous operation.")
 
-        print(f"\nAI Component Manager initialized with model: {self.model_name}")
-        print(f"Rate limit set to {self.RPM_LIMIT} requests per minute.")
-
-    def _apply_rate_limit(self):
+    def _reload_components_and_tools(self):
         """
-        Applies a rate limit by pausing execution if the RPM_LIMIT is approached.
+        Reloads all components from the components directory and rebuilds
+        the list of available Gemini tools.
         """
-        current_time = time.time()
+        log_message("SYSTEM_RELOAD", "Reloading components and rebuilding tools...")
+        # Tell the existing component_manager instance to refresh its components
+        self.component_manager.refresh_components()
+        self.component_manager.load_all_components()
 
-        # Remove timestamps older than 60 seconds
-        while (
-            self.request_timestamps and self.request_timestamps[0] <= current_time - 60
-        ):
-            self.request_timestamps.popleft()
+        # Rebuild tools list from the newly loaded components
+        self.available_tools = self._build_gemini_tools()
+        log_message("SYSTEM_RELOAD", "Components and tools reloaded.")
 
-        # Check if we are at the limit
-        if len(self.request_timestamps) >= self.RPM_LIMIT:
-            # Calculate time to wait until the oldest request in the window expires
-            wait_time = self.request_timestamps[0] + 60 - current_time
-            if wait_time > 0:
-                print(f"Rate limit hit. Waiting for {wait_time:.2f} seconds...")
-                time.sleep(wait_time)
-                # After waiting, clear expired timestamps again
-                current_time = time.time()
-                while (
-                    self.request_timestamps
-                    and self.request_timestamps[0] <= current_time - 60
-                ):
-                    self.request_timestamps.popleft()
-
-        # Add the current request's timestamp
-        self.request_timestamps.append(time.time())
 
     def _get_gemini_type(self, python_type: Any) -> types.Schema:
         """Converts Python types to Gemini's schema types."""
@@ -103,8 +76,8 @@ class AIComponentManager:
         """
         method = getattr(component_instance, "use", None)
         if not method or not inspect.ismethod(method):
-            print(
-                f"Warning: Component '{component_name}' does not have a usable 'use' method."
+            log_message("WARNING",
+                f"Component '{component_name}' does not have a usable 'use' method."
             )
             return None
 
@@ -145,14 +118,18 @@ class AIComponentManager:
         Builds a list of Gemini tools from all loaded components.
         """
         tools_list: List[types.Tool] = []
+        if not self.component_manager: # Should not happen now that it's initialized in __init__
+            log_message("WARNING", "ComponentManager not yet initialized. Cannot build tools.")
+            return []
+
         for name, component in self.component_manager.loaded_components.items():
             tool_declaration = self._component_to_tool_declaration(name, component)
             if tool_declaration:
                 tools_list.append(tool_declaration)
-        print(f"\nBuilt {len(tools_list)} tools for Gemini.")
+        log_message("SYSTEM_TOOL_BUILD", f"Built {len(tools_list)} tools for Gemini.")
         for tool_spec in tools_list:
             for fd in tool_spec.function_declarations:
-                print(
+                log_message("SYSTEM_TOOL_BUILD",
                     f"  - Tool: {fd.name} (Parameters: {list(fd.parameters.properties.keys())})"
                 )
         return tools_list
@@ -160,11 +137,12 @@ class AIComponentManager:
     def _call_tool(self, function_call: types.FunctionCall) -> Any:
         """
         Calls the appropriate component's 'use' method based on Gemini's function call.
+        This method is now a callback for GeminiChatAgent.
         """
         tool_name = function_call.name
         tool_args = function_call.args
 
-        print(f"\nAI requested tool call: {tool_name} with arguments: {tool_args}")
+        log_message("AI_ACTION", f"Executing {tool_name} with args: {tool_args}")
 
         component = self.component_manager.get_component(tool_name)
         if not component:
@@ -172,160 +150,38 @@ class AIComponentManager:
 
         try:
             result = component.use(**tool_args)
-            print(f"Tool '{tool_name}' returned: {result}")
+            log_message("AI_TOOL_RESULT", f"Tool '{tool_name}' returned: {result}")
             return result
         except Exception as e:
             error_message = f"Error executing tool '{tool_name}': {e}"
-            print(error_message)
+            log_message("AI_UNEXPECTED_ERROR", error_message)
             return error_message
 
-    def start_chat_interface(self):
+    def start_autonomous_loop(self):
         """
-        Starts a CLI-based chat interface with the Gemini model and component tools.
+        Starts the continuous autonomous loop for the AI.
+        Allows user to provide guidance or simply press Enter to continue.
         """
-        print("\n--- Starting AI Component Manager Chat ---")
-        print("Type 'exit' or 'quit' to end the session.")
+        log_message("SYSTEM_INIT", "--- Starting AI Autonomous Loop ---")
+        log_message("SYSTEM_INIT", "AI will continuously generate thoughts/actions to achieve its goal.")
+        log_message("SYSTEM_INIT", "Press Enter to let the AI continue, or type a message to interrupt/guide it.")
+        log_message("SYSTEM_INIT", "Type 'exit' or 'quit' to end the session.")
 
-        generate_content_config = types.GenerateContentConfig(
-            tools=self.available_tools,
-            response_mime_type="text/plain",
-        )
+        # Perform initial component load and tool building
+        self._reload_components_and_tools()
 
         while True:
-            user_input = input("\n[You]: ")
+            user_input = input("\n[User (Press Enter to continue, or type a message)]:\n> ")
+
             if user_input.lower() in ["exit", "quit"]:
-                print("Exiting chat. Goodbye!")
+                log_message("SYSTEM_EXIT", "Exiting autonomous loop. Goodbye!")
                 break
+            
+            # BEFORE each AI turn, reload components to reflect any changes made by CodeWriterComponent
+            self._reload_components_and_tools()
 
-            self.chat_history.append(
-                types.Content(role="user", parts=[types.Part(text=user_input)])
+            # Pass the interrupt message (or internal prompt) and the LATEST tools list
+            self.gemini_agent.continue_autonomously(
+                tools=self.available_tools, # Pass the newly built tools
+                interrupt_message= f"Some hidden voice says: {user_input}" if user_input else "proceed"
             )
-
-            try:
-                # Apply rate limit before making a request to the model
-                self._apply_rate_limit()
-
-                # Send the entire chat history for context
-                stream = self.gemini_client.models.generate_content_stream(
-                    model=self.model_name,
-                    contents=self.chat_history,
-                    config=generate_content_config,
-                )
-
-                tool_execution_needed = False
-                for chunk in stream:
-                    if chunk.function_calls:
-                        tool_execution_needed = True
-                        for fc_item in chunk.function_calls:
-                            # Add the model's function call part to history
-                            self.chat_history.append(
-                                types.Content(
-                                    role="model",
-                                    parts=[
-                                        types.Part(
-                                            function_call=types.FunctionCall(
-                                                name=fc_item.name, args=fc_item.args
-                                            )
-                                        )
-                                    ],
-                                )
-                            )
-                            tool_result_value = self._call_tool(fc_item)
-                            # Add the function's response part to history
-                            self.chat_history.append(
-                                types.Content(
-                                    role="function",
-                                    parts=[types.Part(text=str(tool_result_value))],
-                                )
-                            )
-
-                            print(f"\nSending tool output to AI: {tool_result_value}")
-
-                            # Apply rate limit before the follow-up request
-                            self._apply_rate_limit()
-
-                            # Continue the conversation with the updated history
-                            follow_up_stream = (
-                                self.gemini_client.models.generate_content_stream(
-                                    model=self.model_name,
-                                    contents=self.chat_history,
-                                    config=generate_content_config,
-                                )
-                            )
-                            final_ai_response_parts: List[types.Part] = []
-                            for follow_up_chunk in follow_up_stream:
-                                if follow_up_chunk.text:
-                                    print(f"[AI]: {follow_up_chunk.text}", end="")
-                                    final_ai_response_parts.append(
-                                        types.Part(text=follow_up_chunk.text)
-                                    )
-                                elif follow_up_chunk.function_calls:
-                                    print(
-                                        f"\n[AI]: Gemini requested another tool call in response to tool output."
-                                    )
-                                    # For simplicity, we just print here. A real app might re-enter the tool loop.
-                                    for next_fc_item in follow_up_chunk.function_calls:
-                                        print(
-                                            f"  (Further call: {next_fc_item.name} with {next_fc_item.args})"
-                                        )
-                                    # If a chain of calls is expected, this inner loop structure
-                                    # would need a more sophisticated recursive or iterative approach.
-                                    # For this example, we assume at most one follow-up tool call after a response.
-                            print()
-                            if final_ai_response_parts:
-                                self.chat_history.append(
-                                    types.Content(
-                                        role="model", parts=final_ai_response_parts
-                                    )
-                                )
-                        break  # Break from outer chunk loop after handling tool call and follow-up
-
-                    elif chunk.text:
-                        print(f"[AI]: {chunk.text}", end="")
-                        # Append text to history only if it's not part of a tool call chain
-                        # For simple text responses, we append it directly
-                        self.chat_history.append(
-                            types.Content(
-                                role="model", parts=[types.Part(text=chunk.text)]
-                            )
-                        )
-                print()  # Ensure a newline after the AI's initial text response
-
-            except (
-                errors.ClientError
-            ) as e:  # Catch ClientError for API issues including rate limits
-                # Gemini API often returns 429 (Too Many Requests) for rate limits.
-                # However, this also catches other ClientErrors.
-                print(f"[AI]: API Error (ClientError): {e}")
-                # Attempt to remove the last user message and its immediate model response if error occurred
-                if self.chat_history and self.chat_history[-1].role == "user":
-                    self.chat_history.pop()  # Remove the user's message
-                # If the error was a rate limit, the _apply_rate_limit should prevent it
-                # but if an error slips through, this is a catch-all.
-                time.sleep(
-                    5
-                )  # A small pause to prevent rapid re-attempts on generic errors
-            except Exception as e:
-                print(f"An unexpected error occurred: {e}")
-                print("Please try again.")
-                if self.chat_history and self.chat_history[-1].role == "user":
-                    self.chat_history.pop()
-
-
-# --- main.py remains the same ---
-if __name__ == "__main__":
-    try:
-        api_key = os.environ.get("GEMINI_API_KEY")
-        if not api_key:
-            print(
-                "GEMINI_API_KEY environment variable not set. Please set it or hardcode in ai_manager.py for testing."
-            )
-            # DO NOT HARDCODE API KEY IN PRODUCTION CODE
-            # For testing, you could uncomment the line below, but it's not recommended.
-            # api_key = "YOUR_GEMINI_API_KEY_HERE"
-
-        ai_manager = AIComponentManager(components_dir="components", api_key=api_key)
-        ai_manager.start_chat_interface()
-    except ValueError as e:
-        print(f"Initialization error: {e}")
-        print("Please ensure GEMINI_API_KEY is correctly set or passed.")
