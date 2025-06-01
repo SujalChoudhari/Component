@@ -56,14 +56,11 @@ your_project/
 
 ### 2. Installation
 
-Clone this repository and install the necessary Python dependencies:
+Clone this repository and install the necessary Python dependencies.
+Suggested use of `uv-astral` package manager and venv.
 
 ```bash
-git clone <your-repo-url>
-cd your_project
-python -m venv venv
-source venv/bin/activate   # On Windows: .\venv\Scripts\activate
-pip install -r requirements.txt
+uv sync
 ```
 
 **`requirements.txt` content:**
